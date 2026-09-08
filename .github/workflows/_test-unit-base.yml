@@ -68,9 +68,11 @@ jobs:
       - name: Install dependencies
         run: |
           poetry config virtualenvs.in-project true
-          poetry install --with dev,proxy-dev --extras "proxy semantic-router"
-          poetry run pip install google-genai==1.22.0 \
-            google-cloud-aiplatform==1.115.0 fastapi-offline==1.7.3 python-multipart==0.0.22 openapi-core==0.23.0
+          poetry sync --with dev,proxy-dev --extras "proxy semantic-router"
+          poetry run pip freeze --exclude-editable > "${RUNNER_TEMP}/locked-test-constraints.txt"
+          poetry run pip install --constraint "${RUNNER_TEMP}/locked-test-constraints.txt" \
+            google-genai==1.22.0 google-cloud-aiplatform==1.115.0
+          poetry run pip check
 
       - name: Setup litellm-enterprise
         run: |
@@ -90,7 +92,21 @@ jobs:
           WORKERS: ${{ inputs.workers }}
           RERUNS: ${{ inputs.reruns }}
         run: |
-          poetry run pytest ${TEST_PATH:?} \
+          read -r -a test_args <<< "${TEST_PATH:?}"
+          expanded_test_args=()
+          for test_arg in "${test_args[@]}"; do
+            if [[ "$test_arg" == *[\*\?\[]* ]]; then
+              mapfile -t glob_matches < <(compgen -G "$test_arg")
+              if (( ${#glob_matches[@]} == 0 )); then
+                echo "Test pattern matched no files" >&2
+                exit 1
+              fi
+              expanded_test_args+=("${glob_matches[@]}")
+            else
+              expanded_test_args+=("$test_arg")
+            fi
+          done
+          poetry run pytest "${expanded_test_args[@]}" \
             --tb=short -vv \
             --maxfail="${MAX_FAILURES}" \
             -n "${WORKERS}" \
@@ -113,7 +129,7 @@ jobs:
   upload-coverage:
     name: Upload coverage to Codecov
     needs: run
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

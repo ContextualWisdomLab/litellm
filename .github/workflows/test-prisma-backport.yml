@@ -1,0 +1,23 @@
+name: Prisma Backport Regression
+
+on:
+  pull_request:
+    branches: [support/1.83.7]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prisma-watchdog:
+    uses: ./.github/workflows/_test-unit-base.yml
+    with:
+      test-path: tests/litellm/proxy/test_prisma_engine_watchdog.py tests/test_unit_workflow_paths.py
+      workers: 0
+      reruns: 0
+      artifact-name: prisma-backport

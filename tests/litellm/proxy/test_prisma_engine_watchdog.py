@@ -48,8 +48,11 @@ def engine_client(mock_proxy_logging) -> PrismaClient:
     Minimal PrismaClient fixture for engine watchdog tests.
     Uses the real constructor pattern from PR #21706 (database_url).
     """
-    client = PrismaClient(database_url="mock://test", proxy_logging_obj=mock_proxy_logging)
+    client = PrismaClient(
+        database_url="mock://test", proxy_logging_obj=mock_proxy_logging
+    )
     client.db = MagicMock()
+    client.db._original_prisma._engine = None
     client.db.recreate_prisma_client = AsyncMock()
     client.db.disconnect = AsyncMock(return_value=None)
     client.db.connect = AsyncMock(return_value=None)
@@ -95,6 +98,31 @@ def test_is_engine_alive_returns_true_for_running_process(engine_client):
 
 
 @pytest.mark.asyncio
+async def test_poll_restart_retires_previous_task(engine_client):
+    """Rapid watcher replacement must leave only the new fallback poll alive."""
+    with (
+        patch.object(engine_client, "_get_engine_pid", return_value=1234),
+        patch.object(engine_client, "_try_waitpid_watch", return_value=False),
+        patch.object(engine_client, "_try_pidfd_watch", return_value=False),
+        patch("os.kill"),
+    ):
+        await engine_client._start_engine_watcher()
+        old_task = engine_client._engine_poll_task
+        await asyncio.sleep(0)
+        engine_client._stop_engine_watcher()
+        await engine_client._start_engine_watcher()
+        new_task = engine_client._engine_poll_task
+        try:
+            await asyncio.sleep(0)
+            assert old_task.cancelled()
+            assert new_task is not old_task
+            assert not new_task.done()
+        finally:
+            engine_client._stop_engine_watcher()
+            await asyncio.gather(old_task, new_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_poll_missing_process_triggers_reconnect(engine_client) -> None:
     """Polling loop triggers attempt_db_reconnect when os.kill raises ProcessLookupError."""
     engine_client._engine_pid = 1234
@@ -102,7 +130,10 @@ async def test_poll_missing_process_triggers_reconnect(engine_client) -> None:
     engine_client.attempt_db_reconnect = AsyncMock(return_value=True)
 
     with patch("os.kill", side_effect=ProcessLookupError):
-        await engine_client._poll_engine_proc()
+        engine_client._engine_poll_task = asyncio.create_task(
+            engine_client._poll_engine_proc()
+        )
+        await engine_client._engine_poll_task
 
     engine_client.attempt_db_reconnect.assert_awaited_once_with(
         reason="engine_process_death",
@@ -216,7 +247,9 @@ async def test_run_reconnect_cycle_uses_heavy_path_when_engine_dead(
     ):
         await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
 
-    engine_client.db.recreate_prisma_client.assert_awaited_once_with("postgresql://test")
+    engine_client.db.recreate_prisma_client.assert_awaited_once_with(
+        "postgresql://test"
+    )
     engine_client._start_engine_watcher.assert_awaited_once()
     engine_client.db.connect.assert_not_awaited()
 
@@ -241,10 +274,79 @@ async def test_run_reconnect_cycle_uses_heavy_path_when_confirmed_dead(
     ):
         await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
 
-    engine_client.db.recreate_prisma_client.assert_awaited_once_with("postgresql://test")
+    engine_client.db.recreate_prisma_client.assert_awaited_once_with(
+        "postgresql://test"
+    )
     engine_client._start_engine_watcher.assert_awaited_once()
     engine_client.db.connect.assert_not_awaited()
     assert engine_client._engine_confirmed_dead is False  # Reset after use
+
+
+@pytest.mark.asyncio
+async def test_direct_reconnect_ignores_expected_old_engine_exit(engine_client):
+    """Intentional disconnect must not schedule a second engine-death reconnect."""
+    engine_client._engine_pid = 1234
+    engine_client.attempt_db_reconnect = AsyncMock()
+
+    async def disconnect_old_engine():
+        engine_client._on_engine_death_from_thread(1234)
+        await asyncio.sleep(0)
+
+    engine_client.db.disconnect.side_effect = disconnect_old_engine
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=1234),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+
+    engine_client.attempt_db_reconnect.assert_not_awaited()
+    start_watcher.assert_awaited_once()
+    assert engine_client._engine_confirmed_dead is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probe_error", [RuntimeError("probe failed"), asyncio.CancelledError()]
+)
+async def test_direct_reconnect_rearms_before_probe_failure(engine_client, probe_error):
+    """A failed or cancelled probe must leave the new engine watched."""
+    engine_client._engine_pid = 1234
+    engine_client.db.query_raw.side_effect = probe_error
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=1234),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        with pytest.raises(type(probe_error)):
+            await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+    start_watcher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_direct_reconnect_recovers_after_connect_failure(engine_client):
+    """A failed connect must allow the next recovery cycle to re-arm detection."""
+    engine_client._engine_pid = 1234
+    engine_client.db.connect.side_effect = [ConnectionError("unavailable"), None]
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=0),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        with pytest.raises(ConnectionError):
+            await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+        start_watcher.assert_not_awaited()
+        assert engine_client._engine_pid == 0
+        await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+        start_watcher.assert_awaited_once()
+    assert engine_client.db.connect.await_count == 2
+    engine_client.db.query_raw.assert_awaited_once_with("SELECT 1")
 
 
 @pytest.mark.asyncio
@@ -522,12 +624,16 @@ async def test_successful_reconnect_resets_failure_counter(engine_client):
 def test_escalation_threshold_env_var(mock_proxy_logging):
     """PRISMA_RECONNECT_ESCALATION_THRESHOLD env var is respected."""
     with patch.dict(os.environ, {"PRISMA_RECONNECT_ESCALATION_THRESHOLD": "5"}):
-        client = PrismaClient(database_url="mock://test", proxy_logging_obj=mock_proxy_logging)
+        client = PrismaClient(
+            database_url="mock://test", proxy_logging_obj=mock_proxy_logging
+        )
     assert client._reconnect_escalation_threshold == 5
 
 
 def test_escalation_threshold_min_guard(mock_proxy_logging):
     """Escalation threshold cannot be set below 1."""
     with patch.dict(os.environ, {"PRISMA_RECONNECT_ESCALATION_THRESHOLD": "0"}):
-        client = PrismaClient(database_url="mock://test", proxy_logging_obj=mock_proxy_logging)
+        client = PrismaClient(
+            database_url="mock://test", proxy_logging_obj=mock_proxy_logging
+        )
     assert client._reconnect_escalation_threshold == 1
