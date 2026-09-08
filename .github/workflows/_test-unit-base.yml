@@ -90,7 +90,8 @@ jobs:
           WORKERS: ${{ inputs.workers }}
           RERUNS: ${{ inputs.reruns }}
         run: |
-          poetry run pytest ${TEST_PATH:?} \
+          read -r -a test_args <<< "${TEST_PATH:?}"
+          poetry run pytest "${test_args[@]}" \
             --tb=short -vv \
             --maxfail="${MAX_FAILURES}" \
             -n "${WORKERS}" \
