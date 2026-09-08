@@ -69,8 +69,10 @@ jobs:
         run: |
           poetry config virtualenvs.in-project true
           poetry install --with dev,proxy-dev --extras "proxy semantic-router"
-          poetry run pip install google-genai==1.22.0 \
-            google-cloud-aiplatform==1.115.0 fastapi-offline==1.7.3 python-multipart==0.0.22 openapi-core==0.23.0
+          poetry run pip freeze --exclude-editable > "${RUNNER_TEMP}/locked-test-constraints.txt"
+          poetry run pip install --constraint "${RUNNER_TEMP}/locked-test-constraints.txt" \
+            google-genai==1.22.0 google-cloud-aiplatform==1.115.0 openapi-core==0.23.0
+          poetry run pip check
 
       - name: Setup litellm-enterprise
         run: |
