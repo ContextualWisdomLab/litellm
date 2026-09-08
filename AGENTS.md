@@ -97,6 +97,8 @@ LiteLLM is a unified interface for 100+ LLMs that:
 ## PROXY SERVER (LLM GATEWAY)
 
 - Before intentionally disconnecting a Prisma engine during reconnect, stop its death watcher; after connecting the replacement, re-arm the watcher before probing readiness. Otherwise the expected old-engine exit can schedule another reconnect. Cover delayed old-PID callbacks and probe failure/cancellation in `tests/litellm/proxy/test_prisma_engine_watchdog.py`. Source-level reproduction does not prove the initial watchdog timeout cause or a deployed fix.
+- Own the polling fallback task explicitly: cancel the previous task before re-arming, but do not cancel the task performing its own recovery. A shared watching flag alone allows old and new polling tasks to coexist after rapid stop/start.
+- In cancellable PR workflows, use `!cancelled()` for dependent coverage jobs instead of `always()`. A cancelled test job can otherwise leave coverage queued and retain the concurrency slot (Actions run 34183255749). Verify terminal run state after cancellation; distinguish queued jobs from executed tests.
 
 The proxy server is a critical component that provides:
 - Authentication and authorization
