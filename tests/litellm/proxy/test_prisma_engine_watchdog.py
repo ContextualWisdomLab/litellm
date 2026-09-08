@@ -328,6 +328,28 @@ async def test_direct_reconnect_rearms_before_probe_failure(engine_client, probe
 
 
 @pytest.mark.asyncio
+async def test_direct_reconnect_recovers_after_connect_failure(engine_client):
+    """A failed connect must allow the next recovery cycle to re-arm detection."""
+    engine_client._engine_pid = 1234
+    engine_client.db.connect.side_effect = [ConnectionError("unavailable"), None]
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=0),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        with pytest.raises(ConnectionError):
+            await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+        start_watcher.assert_not_awaited()
+        assert engine_client._engine_pid == 0
+        await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+        start_watcher.assert_awaited_once()
+    assert engine_client.db.connect.await_count == 2
+    engine_client.db.query_raw.assert_awaited_once_with("SELECT 1")
+
+
+@pytest.mark.asyncio
 async def test_run_reconnect_cycle_uses_lightweight_path_when_engine_alive(
     engine_client,
 ) -> None:
