@@ -248,6 +248,51 @@ async def test_run_reconnect_cycle_uses_heavy_path_when_confirmed_dead(
 
 
 @pytest.mark.asyncio
+async def test_direct_reconnect_ignores_expected_old_engine_exit(engine_client):
+    """Intentional disconnect must not schedule a second engine-death reconnect."""
+    engine_client._engine_pid = 1234
+    engine_client.attempt_db_reconnect = AsyncMock()
+
+    async def disconnect_old_engine():
+        engine_client._on_engine_death_from_thread(1234)
+        await asyncio.sleep(0)
+
+    engine_client.db.disconnect.side_effect = disconnect_old_engine
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=1234),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+
+    engine_client.attempt_db_reconnect.assert_not_awaited()
+    start_watcher.assert_awaited_once()
+    assert engine_client._engine_confirmed_dead is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probe_error", [RuntimeError("probe failed"), asyncio.CancelledError()]
+)
+async def test_direct_reconnect_rearms_before_probe_failure(engine_client, probe_error):
+    """A failed or cancelled probe must leave the new engine watched."""
+    engine_client._engine_pid = 1234
+    engine_client.db.query_raw.side_effect = probe_error
+    with (
+        patch.object(engine_client, "_is_engine_alive", return_value=True),
+        patch.object(engine_client, "_get_engine_pid", return_value=1234),
+        patch.object(
+            engine_client, "_start_engine_watcher", new_callable=AsyncMock
+        ) as start_watcher,
+    ):
+        with pytest.raises(type(probe_error)):
+            await engine_client._run_reconnect_cycle(timeout_seconds=5.0)
+    start_watcher.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_run_reconnect_cycle_uses_lightweight_path_when_engine_alive(
     engine_client,
 ) -> None:

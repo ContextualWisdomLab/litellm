@@ -4119,6 +4119,8 @@ class PrismaClient:
 
             async def _do_direct_reconnect() -> None:
                 old_pid = self._get_engine_pid()
+                # Disconnect intentionally retires this engine; ignore its exit.
+                self._stop_engine_watcher()
                 try:
                     await self.db.disconnect()
                 except Exception as disconnect_err:
@@ -4129,6 +4131,7 @@ class PrismaClient:
                     await PrismaWrapper._kill_engine_process(old_pid)
 
                 await self.db.connect()
+                await self._start_engine_watcher()
                 await self.db.query_raw("SELECT 1")
 
             await asyncio.wait_for(_do_direct_reconnect(), timeout=effective_timeout)

@@ -96,6 +96,8 @@ LiteLLM is a unified interface for 100+ LLMs that:
 
 ## PROXY SERVER (LLM GATEWAY)
 
+- Before intentionally disconnecting a Prisma engine during reconnect, stop its death watcher; after connecting the replacement, re-arm the watcher before probing readiness. Otherwise the expected old-engine exit can schedule another reconnect. Cover delayed old-PID callbacks and probe failure/cancellation in `tests/litellm/proxy/test_prisma_engine_watchdog.py`. Source-level reproduction does not prove the initial watchdog timeout cause or a deployed fix.
+
 The proxy server is a critical component that provides:
 - Authentication and authorization
 - Rate limiting and budget management
