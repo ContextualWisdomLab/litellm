@@ -93,7 +93,20 @@ jobs:
           RERUNS: ${{ inputs.reruns }}
         run: |
           read -r -a test_args <<< "${TEST_PATH:?}"
-          poetry run pytest "${test_args[@]}" \
+          expanded_test_args=()
+          for test_arg in "${test_args[@]}"; do
+            if [[ "$test_arg" == *[\*\?\[]* ]]; then
+              mapfile -t glob_matches < <(compgen -G "$test_arg")
+              if (( ${#glob_matches[@]} == 0 )); then
+                echo "Test pattern matched no files" >&2
+                exit 1
+              fi
+              expanded_test_args+=("${glob_matches[@]}")
+            else
+              expanded_test_args+=("$test_arg")
+            fi
+          done
+          poetry run pytest "${expanded_test_args[@]}" \
             --tb=short -vv \
             --maxfail="${MAX_FAILURES}" \
             -n "${WORKERS}" \

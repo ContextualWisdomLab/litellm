@@ -17,7 +17,7 @@ jobs:
   prisma-watchdog:
     uses: ./.github/workflows/_test-unit-base.yml
     with:
-      test-path: tests/litellm/proxy/test_prisma_engine_watchdog.py
+      test-path: tests/litellm/proxy/test_prisma_engine_watchdog.py tests/test_unit_workflow_paths.py
       workers: 0
       reruns: 0
       artifact-name: prisma-backport
