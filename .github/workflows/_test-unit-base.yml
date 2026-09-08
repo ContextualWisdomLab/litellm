@@ -113,7 +113,7 @@ jobs:
   upload-coverage:
     name: Upload coverage to Codecov
     needs: run
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
