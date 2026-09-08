@@ -2,20 +2,40 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [main]
+    branches: [main, litellm_internal_staging, "support/1.83.7"]
   pull_request:
-    branches: [main]
+    branches: [main, litellm_internal_staging, "support/1.83.7"]
+  workflow_dispatch:
   schedule:
     # Run daily at 04:00 UTC
     - cron: "0 4 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
+  detect-languages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.languages.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - name: Check language selection
+        run: python3 tests/litellm/test_codeql_language_matrix.py
+      - name: Detect tracked source languages
+        id: languages
+        run: echo "matrix=$(python3 .github/scripts/codeql_language_matrix.py)" >> "$GITHUB_OUTPUT"
+
   analyze:
-    if: github.event_name != 'schedule' || github.repository == 'BerriAI/litellm'
+    needs: detect-languages
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -27,20 +47,26 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - language: actions
-            build-mode: none
-          - language: javascript-typescript
-            build-mode: none
-          - language: python
-            build-mode: none
+      matrix: ${{ fromJSON(needs.detect-languages.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           persist-credentials: false
+
+      - name: Include Ruby test sources without changing query policy
+        if: matrix.language == 'ruby'
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          config_path = Path('.github/codeql/codeql-config.yml')
+          config_text = config_path.read_text()
+          ignored_paths = 'paths-ignore:\n  - tests\n  - docs\n  - "**/*.md"\n'
+          if config_text.count(ignored_paths) != 1:
+              raise SystemExit('CodeQL path policy changed; review Ruby source inclusion')
+          config_path.write_text(config_text.replace(ignored_paths, ''))
+          PYCODE
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@ebcb5b36ded6beda4ceefea6a8bc4cc885255bb3 # v3
