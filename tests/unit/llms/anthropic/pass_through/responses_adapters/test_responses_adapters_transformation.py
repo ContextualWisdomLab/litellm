@@ -5,11 +5,10 @@ Tests for LiteLLMAnthropicToResponsesAPIAdapter
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, Final, List
 from unittest.mock import MagicMock
 
 import pytest
-
 
 from litellm.constants import (
     DEFAULT_REASONING_EFFORT_HIGH_THINKING_BUDGET,
@@ -22,6 +21,7 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     encrypted_reasoning_signature,
 )
 from litellm.llms.anthropic.pass_through.responses_adapters.transformation import (
+    RESPONSES_INSTRUCTIONS_MAX_CHARS,
     LiteLLMAnthropicToResponsesAPIAdapter,
 )
 from litellm.types.llms.anthropic import (
@@ -623,9 +623,7 @@ class TestTranslateMessagesToResponsesInput:
             }
         ]
         result = _translate_messages(messages)
-        assert result == [
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Private reasoning."}]}
-        ]
+        assert result == [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "Private reasoning."}]}]
 
     def test_consecutive_thinking_blocks_become_one_reasoning_item(self):
         """Summary parts of one upstream reasoning item are regrouped into that item."""
@@ -1066,6 +1064,28 @@ class TestTranslateRequestBroaderCoverage:
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["instructions"] == "You are a helpful assistant."
 
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    @pytest.mark.parametrize("block_list", [False, True])
+    def test_oversized_system_moves_losslessly_to_leading_developer_input(self, offset: int, block_list: bool):
+        length: Final = RESPONSES_INSTRUCTIONS_MAX_CHARS + offset
+        text: Final = "α" * (length - 5) + "\n尾\n終!"
+        system: Final = (
+            [{"type": "text", "text": text[:-5]}, {"type": "text", "text": text[-4:]}] if block_list else text
+        )
+        req: Final = _make_request(system=system)
+        kwargs: Final = _ADAPTER.translate_request(req)
+        user_input: Final = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
+        if offset <= 0:
+            assert kwargs["instructions"] == text
+            assert kwargs["input"] == user_input
+        else:
+            assert kwargs["instructions"] == ""
+            assert kwargs["input"] == [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": text}]},
+                *user_input,
+            ]
+        assert req["system"] == system
+
     def test_top_level_system_and_midturn_correction_are_not_duplicated(self):
         """
         Request level: the trusted top-level prompt goes to `instructions` only, and the
@@ -1150,6 +1170,39 @@ class TestTranslateRequestBroaderCoverage:
         )
         kwargs = _ADAPTER.translate_request(req)
         assert kwargs["tool_choice"] == {"type": "function", "name": "do_thing"}
+
+    @pytest.mark.parametrize("name", ["web_search", "search_the_web"])
+    def test_forced_builtin_web_search_choice_matches_converted_declaration(self, name: str):
+        req: Final = _make_request(
+            tools=[
+                {"name": "calculator", "input_schema": {"type": "object"}},
+                {"type": "web_search_20250305", "name": name},
+            ],
+            tool_choice={"type": "tool", "name": name},
+        )
+        kwargs: Final = _ADAPTER.translate_request(req)
+        assert kwargs["tools"] == [
+            {"type": "function", "name": "calculator", "strict": False, "parameters": {"type": "object"}},
+            {"type": "web_search_preview"},
+        ]
+        assert kwargs["tool_choice"] == kwargs["tools"][1]
+
+    @pytest.mark.parametrize(
+        "choice, expected",
+        [
+            ({"type": "auto"}, "auto"),
+            ({"type": "any"}, "required"),
+            ({"type": "none"}, "none"),
+            ({"type": "tool", "name": "calculator"}, {"type": "function", "name": "calculator"}),
+        ],
+    )
+    def test_builtin_declaration_preserves_other_tool_choices(self, choice, expected):
+        req: Final = _make_request(
+            tools=[{"type": "web_search_20250305", "name": "web_search"}, {"name": "calculator"}],
+            tool_choice=choice,
+        )
+        kwargs: Final = _ADAPTER.translate_request(req)
+        assert kwargs["tool_choice"] == expected
 
     def test_thinking_translated_to_reasoning(self):
         req = _make_request(thinking={"type": "enabled", "budget_tokens": 12000})

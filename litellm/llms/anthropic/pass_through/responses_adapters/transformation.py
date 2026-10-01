@@ -6,7 +6,7 @@ path used for OpenAI and Azure models.
 """
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import groupby
 from typing import Any, Final, cast
 
@@ -51,6 +51,7 @@ from litellm.types.llms.openai import (
 
 REASONING_SUMMARY_PART_SEPARATOR: Final = "\n\n"
 RESPONSES_INCLUDE_ENCRYPTED_REASONING: Final = "reasoning.encrypted_content"
+RESPONSES_INSTRUCTIONS_MAX_CHARS: Final = 1_048_576
 
 
 class LiteLLMAnthropicToResponsesAPIAdapter:
@@ -390,7 +391,7 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
 
     def translate_tools_to_responses_api(
         self,
-        tools: list[AllAnthropicToolsValues],
+        tools: Sequence[AllAnthropicToolsValues],
     ) -> list[dict[str, object]]:
         """Convert Anthropic tool definitions to Responses API function tools."""
         result: Final[list[dict[str, object]]] = []
@@ -416,16 +417,24 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             result.append(func_tool)
         return result
 
-    @staticmethod
     def translate_tool_choice_to_responses_api(
+        self,
         tool_choice: AnthropicMessagesToolChoice,
+        tools: Sequence[AllAnthropicToolsValues] | None = None,
     ) -> str | dict[str, object]:
         """Convert Anthropic tool_choice to Responses API tool_choice."""
         tc_type: Final = tool_choice.get("type")
         if tc_type == "any":
             return "required"
         elif tc_type == "tool":
-            return {"type": "function", "name": tool_choice.get("name", "")}
+            name: Final = tool_choice.get("name", "")
+            for tool in tools or ():
+                if tool.get("name") == name:
+                    translated: Final = self.translate_tools_to_responses_api((tool,))[0]
+                    if translated["type"] != "function":
+                        return translated
+                    break
+            return {"type": "function", "name": name}
         elif tc_type == "none":
             return "none"
         return "auto"
@@ -553,6 +562,18 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     filter(None, (b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"))
                 )
 
+            instructions: Final = responses_kwargs.get("instructions")
+            if isinstance(instructions, str) and len(instructions) > RESPONSES_INSTRUCTIONS_MAX_CHARS:
+                input_items.insert(
+                    0,
+                    {  # mutable-ok: API message payload
+                        "type": "message",
+                        "role": "developer",
+                        "content": self._translate_midturn_system_content_to_responses(instructions),
+                    },
+                )
+                responses_kwargs["instructions"] = ""
+
         # max_tokens -> max_output_tokens
         max_tokens: Final = anthropic_request.get("max_tokens")
         if max_tokens:
@@ -565,17 +586,16 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
             responses_kwargs["top_p"] = anthropic_request["top_p"]
 
         # tools
-        tools: Final = anthropic_request.get("tools")
+        tools: Final = cast(Sequence[AllAnthropicToolsValues] | None, anthropic_request.get("tools"))
         if tools:
-            responses_kwargs["tools"] = self.translate_tools_to_responses_api(
-                cast(list[AllAnthropicToolsValues], tools)
-            )
+            responses_kwargs["tools"] = self.translate_tools_to_responses_api(tools)
 
         # tool_choice
         tool_choice: Final = anthropic_request.get("tool_choice")
         if tool_choice:
             responses_kwargs["tool_choice"] = self.translate_tool_choice_to_responses_api(
-                cast(AnthropicMessagesToolChoice, tool_choice)
+                cast(AnthropicMessagesToolChoice, tool_choice),
+                tools,
             )
 
         # thinking -> reasoning
